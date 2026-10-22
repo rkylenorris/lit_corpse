@@ -7,7 +7,9 @@ authors = [
     { name = "R. Kyle Norris", email = "r.kyle.norris@gmail.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "spacy>=3.8.16",
+]
 
 [project.scripts]
 lit-corpse = "lit_corpse:main"
