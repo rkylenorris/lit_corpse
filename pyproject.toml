@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "loguru>=0.7.3",
     "spacy>=3.8.16",
 ]
 
