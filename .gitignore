@@ -9,5 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
-data/
+data/*.json
+data/*.txt
+data/*.md
 *.db
