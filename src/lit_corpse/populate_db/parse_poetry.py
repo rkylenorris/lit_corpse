@@ -1,124 +1,166 @@
 import gzip
 import json
-import spacy
 import sqlite3
-
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Generator
 
+import spacy
 from spacy.tokens import Doc
+
 from ..logger import get_logger
-from .init_db import get_db_connection
+from .init_db import (
+    DEFAULT_DB_PATH,
+    get_db_connection,
+    initialize_database,
+    resolve_db_path,
+)
+
+logger = get_logger()
+
+DEFAULT_GZ_CANDIDATES = [
+    Path("data/gutenberg-poetry-corpus.ndjson.gz"),
+    Path("data/gutenberg-poetry-v001.ndjson.gz"),
+    Path("gutenberg-poetry-corpus.ndjson.gz"),
+    Path("gutenberg-poetry-v001.ndjson.gz"),
+]
 
 
-logger = get_logger() # initialize logger for this module
+def resolve_gz_path(gz_path: Path | str | None = None) -> Path:
+    """Find and return an existing gzip dataset path."""
+    if gz_path is not None:
+        path = Path(gz_path)
+        if path.exists():
+            return path
+        raise FileNotFoundError(f"Specified corpus file '{gz_path}' does not exist.")
 
-GZ_FILE_PATH = Path("data/gutenberg-poetry-corpus.ndjson.gz")
+    for candidate in DEFAULT_GZ_CANDIDATES:
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        "Poetry corpus not found. Looked in: "
+        + ", ".join(str(p) for p in DEFAULT_GZ_CANDIDATES)
+    )
+
 
 @dataclass
 class LineRecord:
+    """Dataclass to hold parsed line information for database insertion.
+
+    text: The raw poetic line string.
+    start_pos: Universal POS tag of first non-punctuation token.
+    end_pos: Universal POS tag of last non-punctuation token.
+    ends_punct: Binary flag (1 if ending in '.', '!', '?', or ';', otherwise 0).
     """
-    Dataclass to hold parsed line information for database insertion.
-    
-    text: The text of the line.
-    start_pos: The part-of-speech tag of the first valid token in the line.
-    end_pos: The part-of-speech tag of the last valid token in the line.
-    ends_punct: An integer flag indicating if the line ends with punctuation (1) or not (0).
-    ends_terminal_punct: An integer flag indicating if the line ends with terminal punctuation (., !, ?) (1) or not (0).
-    """
+
     text: str
     start_pos: str
     end_pos: str
     ends_punct: int
-    ends_terminal_punct: int
 
 
-# 3. Stream and Filter Raw Lines
-def stream_corpus(file_path: Path, min_words: int = 3, max_words: int = 20):
-    """Reads compressed poetry corpus and returns lines
+def stream_corpus(
+    file_path: Path | str,
+    min_words: int = 3,
+    max_words: int = 20,
+    max_lines: int | None = None,
+) -> Generator[str, None, None]:
+    """Reads compressed poetry corpus and lazily yields valid line strings.
 
     Args:
-        file_path (Path): path to the compressed poetry corpus file (gzip format).
-        min_words (int, optional): Minimum number of words a line must have. Defaults to 3.
-        max_words (int, optional): Maximum number of words a line can have. Defaults to 20.
+        file_path: Path to the compressed NDJSON poetry corpus file (.ndjson.gz).
+        min_words: Minimum number of words a line must have.
+        max_words: Maximum number of words a line can have.
+        max_lines: Optional maximum number of lines to yield (useful for testing/benchmarking).
 
     Yields:
-        str: Clean line strings from the compressed dataset.
+        Clean line strings from the compressed dataset.
     """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset file '{path}' not found.")
 
+    logger.debug(
+        f"Reading compressed dataset '{path}' and filtering for lines with {min_words}-{max_words} words..."
+    )
 
-    logger.debug(f"Reading compressed dataset and filtering for lines with {min_words}-{max_words} words...")
-
-    # Open the gzip file and read line by line
-    with gzip.open(file_path, "rt", encoding="utf-8") as f:
+    yielded_count = 0
+    with gzip.open(path, "rt", encoding="utf-8") as f:
         for raw_line in f:
-            # Parse JSON, extracting whitespace stripped line text
-            data = json.loads(raw_line)
-            line_text = data.get("s", "").strip()
+            try:
+                data = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
 
-            # Filter out empty, very short, or excessively long lines
+            line_text = data.get("s", "").strip()
+            if not line_text:
+                continue
+
             words = line_text.split()
             if min_words <= len(words) <= max_words:
                 yield line_text
+                yielded_count += 1
+                if max_lines is not None and yielded_count >= max_lines:
+                    break
 
 
 def parse_nlp_line(doc: Doc) -> LineRecord | None:
-    """Parse relevant information from NLP Doc object and text
+    """Parse relevant information from NLP Doc object and text.
 
     Args:
-        doc (Doc): spacy Doc object representing a single line of text.
+        doc: SpaCy Doc object representing a single line of text.
 
     Returns:
-        LineRecord | None: Information about the line for database insertion, or None if the line is invalid.
+        LineRecord | None: Information about the line for database insertion, or None if invalid.
     """
-
-    # Filter out punctuation and whitespace tokens
-    valid_tokens = [token for token in doc if not token.is_punct and not token.is_space]
+    valid_tokens = [t for t in doc if not t.is_punct and not t.is_space]
     if not valid_tokens:
         return None
 
-    final_token = valid_tokens[-1]
-    ends_punct = 1 if (final_token.is_punct or final_token.is_space) else 0
-    
-    # Extract relevant information from the SpaCy Doc object
-    text = doc.text
+    text = doc.text.strip()
+    if not text:
+        return None
+
     start_pos = valid_tokens[0].pos_
     end_pos = valid_tokens[-1].pos_
-    ends_punct = 1 if (final_token.is_punct or final_token.is_space) else 0
-    ends_terminal_punct = 1 if text[-1] in {".", "!", "?"} else 0
 
-    # Create a LineRecord dataclass instance
-    line_record = LineRecord(
+    # Binary flag (1 if ending in '.', '!', '?', or ';', otherwise 0)
+    terminal_chars = {".", "!", "?", ";"}
+    ends_punct = 0
+    if text[-1] in terminal_chars:
+        ends_punct = 1
+    elif len(text) > 1 and text[-1] in {'"', "'", "”", "’", ")", "]"} and text[-2] in terminal_chars:
+        ends_punct = 1
+
+    return LineRecord(
         text=text,
         start_pos=start_pos,
         end_pos=end_pos,
         ends_punct=ends_punct,
-        ends_terminal_punct=ends_terminal_punct,
     )
-
-    return line_record
 
 
 def _insert_records(cursor: sqlite3.Cursor, records: list[LineRecord]) -> None:
-    """Insert a batch of parsed line records."""
+    """Insert a batch of parsed line records into the lines table."""
     cursor.executemany(
-        "INSERT INTO lines (text, start_pos, end_pos, ends_punct, ends_terminal_punct) VALUES (?, ?, ?, ?, ?)",
-        [(r.text, r.start_pos, r.end_pos, r.ends_punct, r.ends_terminal_punct) for r in records],
+        "INSERT INTO lines (text, start_pos, end_pos, ends_punct) VALUES (?, ?, ?, ?)",
+        [(r.text, r.start_pos, r.end_pos, r.ends_punct) for r in records],
     )
 
+
 def insert_records(cursor: sqlite3.Cursor, records: list[LineRecord], total_inserted: int) -> int:
-    """Insert records, commit db, and log running total
+    """Insert records, commit db, and log running total.
 
     Args:
-        cursor (sqlite3.Cursor): db cursor to execute insert statements
-        records (list[LineRecord]): records to insert into the database
-        total_inserted (int): running total of records inserted so far
+        cursor: SQLite cursor.
+        records: Batch of LineRecord instances.
+        total_inserted: Running count of inserted records.
 
     Returns:
-        int: Updated total of records inserted
+        int: Updated total inserted count.
     """
     if not records:
-        logger.debug("No records to insert.")
         return total_inserted
 
     try:
@@ -129,47 +171,61 @@ def insert_records(cursor: sqlite3.Cursor, records: list[LineRecord], total_inse
 
     cursor.connection.commit()
     total_inserted += len(records)
-    logger.info(f"Inserted {len(records)} new records into the database. Total inserted: {total_inserted}")
+    logger.info(f"Inserted {len(records)} records. Total: {total_inserted:,}")
     return total_inserted
 
 
-def process_poetry_corpus_and_load_db():
-    """Streams compressed corpus, parses relavant information, and inserts records to DB
-    """
+def process_poetry_corpus_and_load_db(
+    gz_path: Path | str | None = None,
+    db_path: Path | str = DEFAULT_DB_PATH,
+    batch_size: int = 5000,
+    max_lines: int | None = None,
+    reinit: bool = True,
+) -> int:
+    """Stream compressed corpus, parse POS tags with SpaCy, and insert records into SQLite.
 
-    logger.info(f"Initializing NLP pipeline to process lines from '{GZ_FILE_PATH}'...")
-    # Load Lightweight SpaCy Model (Disable Unnecessary Pipelines)
+    Args:
+        gz_path: Path to .ndjson.gz file (auto-detected if None).
+        db_path: Path to target SQLite database.
+        batch_size: Number of lines to process per SpaCy and SQLite batch.
+        max_lines: Optional limit on the number of lines to ingest.
+        reinit: If True, re-creates the database schema before ingesting.
+
+    Returns:
+        int: Total number of records successfully ingested.
+    """
+    target_gz = resolve_gz_path(gz_path)
+    target_db = Path(db_path)
+
+    if reinit:
+        logger.info(f"Initializing database at '{target_db}'...")
+        initialize_database(target_db)
+
+    logger.info("Loading lightweight SpaCy model (en_core_web_sm)...")
     nlp = spacy.load("en_core_web_sm", disable=["parser", "ner", "lemmatizer"])
 
-    logger.info("Creating generator for raw lines from the compressed dataset...")
-    BATCH_SIZE = 5000
-    line_generator = stream_corpus(GZ_FILE_PATH)
+    logger.info(f"Streaming lines from '{target_gz}'...")
+    line_generator = stream_corpus(target_gz, max_lines=max_lines)
 
-    records_to_insert = []
+    records_to_insert: list[LineRecord] = []
     total_processed = 0
 
-    logger.info("Processing lines into SQLite database...")
-    
-    # Batch Process with SpaCy and Save to SQLite
-    with get_db_connection() as conn:
+    with get_db_connection(target_db) as conn:
         cursor = conn.cursor()
 
-        # Process texts in batches via SpaCy pipeline
-        for doc in nlp.pipe(line_generator, batch_size=BATCH_SIZE):
+        for doc in nlp.pipe(line_generator, batch_size=batch_size):
             record = parse_nlp_line(doc)
             if record is None:
                 continue
 
             records_to_insert.append(record)
-
-            if len(records_to_insert) >= BATCH_SIZE:
+            if len(records_to_insert) >= batch_size:
                 total_processed = insert_records(cursor, records_to_insert, total_processed)
                 records_to_insert.clear()
 
-    # Final commit for remaining items
         if records_to_insert:
             total_processed = insert_records(cursor, records_to_insert, total_processed)
             records_to_insert.clear()
 
-    logger.info(f"Finished! Total lines indexed: {total_processed:,}")
-
+    logger.info(f"Finished ingestion! Total lines indexed: {total_processed:,}")
+    return total_processed
